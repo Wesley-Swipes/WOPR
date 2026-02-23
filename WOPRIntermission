@@ -1,0 +1,460 @@
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+#include <string.h>
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define MAX_DEVICES   5
+
+static const uint8_t PIN_MOSI = 21;
+static const uint8_t PIN_SCK  = 18;
+static const uint8_t CS_PIN   = 27;
+
+static const uint32_t SPI_HZ = 500000;
+static const uint16_t STARTUP_SETTLE_MS = 250;
+static const uint8_t  INIT_PASSES = 6;
+static const uint16_t INIT_GAP_MS = 70;
+
+const uint8_t H = 8;
+const uint8_t W = MAX_DEVICES * 8;
+const uint8_t INTENSITY = 1;
+
+// Windows
+static const uint8_t MAIN_WIN_W  = 10;
+static const uint8_t MAIN_WIN_H  = 3;
+static const uint8_t MAIN_WIN_X0 = 30;
+static const uint8_t MAIN_WIN_Y0 = 0;
+
+static const uint8_t SHOW_X0 = 0;
+static const uint8_t SHOW_Y0 = 1;
+static const uint8_t SHOW_W  = 26;
+static const uint8_t SHOW_H  = 5;
+static const int8_t  SHOW_Y_SHIFT = +1;
+
+static const uint8_t FACE_W  = 10;
+static const uint8_t FACE_X0 = W - FACE_W;
+
+static const uint8_t LEFT_W  = FACE_X0;
+
+static const uint8_t EYE_W  = 3;
+static const uint8_t EYE_H  = 3;
+static const uint8_t EYE_Y0 = H - EYE_H;
+
+static const uint8_t MOUTH_W  = 4;
+static const uint8_t MOUTH_H  = 3;
+static const uint8_t MOUTH_Y0 = 5;
+
+static const uint8_t EYE_L_X0 = FACE_X0 + 0;
+static const uint8_t MOUTH_X0 = FACE_X0 + EYE_W;
+static const uint8_t EYE_R_X0 = FACE_X0 + EYE_W + MOUTH_W;
+
+// Normal animation timing
+static const uint8_t  LEFT_CHANGE_DIV  = 2;
+static const uint8_t  BIT_DENSITY      = 120;
+static const uint16_t STEP_DELAYS[4]   = { 0, 15, 35, 90 };
+static const uint16_t HOLD_CHANCE_DIV  = 60;
+static const uint16_t HOLD_MIN_MS      = 250;
+static const uint16_t HOLD_MAX_MS      = 1600;
+static const uint8_t MAIN_CHANGE_DIV   = 2;
+static const uint16_t EYE_PATTERN_MIN_MS = 250;
+static const uint16_t EYE_PATTERN_MAX_MS = 1200;
+static const uint16_t MOUTH_STEP_MIN_MS = 300;
+static const uint16_t MOUTH_STEP_MAX_MS = 700;
+
+// Intermission scheduler
+static const uint32_t INTERMISSION_INTERVAL_MS = 30UL * 60UL * 1000UL;
+
+// Intermission timings
+static const uint16_t CRACK_CHAR_STEP_MS_MIN = 28;
+static const uint16_t CRACK_CHAR_STEP_MS_MAX = 55;
+static const uint16_t CRACK_LOCK_HOLD_MS     = 110;
+static const uint16_t CRACK_PHASE_PAUSE_MS   = 350;
+static const uint16_t CRACK_CONFIRM_BLINK_MS = 180;
+static const uint8_t  CRACK_CONFIRM_BLINKS   = 6;
+static const uint16_t CRACK_SOLVED_HOLD_MS   = 3000;
+static const uint16_t POST_CRACK_TO_XO_DELAY_MS = 2000;
+
+static const uint8_t  XO_ROUNDS = 5;
+static const uint16_t XO_ROUND_SPIN_MS[XO_ROUNDS] = { 2600, 2200, 1800, 1400, 1100 };
+static const uint16_t XO_SPIN_STEP_MS[XO_ROUNDS]  = { 230, 180, 140, 105, 80 };
+static const uint16_t XO_LOCK_GAP_MS   = 180;
+static const uint16_t XO_FINAL_HOLD_MS = 420;
+static const uint16_t XO_FLASH_MS      = 120;
+static const uint8_t  XO_FLASH_COUNT   = 4;
+
+static const uint16_t SHUTDOWN_MS       = 5000;
+static const uint16_t MESSAGE_SCROLL_MS = 120;
+static const uint16_t MESSAGE_HOLD_MS   = 10000;
+
+MD_MAX72XX mx(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
+
+struct Glyph3x5 { char c; uint8_t col[3]; };
+
+// RNG
+uint32_t rng32() { static uint32_t x = 0xA3C59AC3u; x ^= x << 13; x ^= x >> 17; x ^= x << 5; return x; }
+uint8_t  urand8() { return (uint8_t)(rng32() & 0xFF); }
+uint16_t urand16(uint16_t n) { return n ? (uint16_t)(rng32() % n) : 0; }
+uint16_t urandRange(uint16_t a, uint16_t b) { return a + urand16((uint16_t)(b - a + 1)); }
+
+inline void setPx(uint8_t x, uint8_t y, bool on) { if (x < W && y < H) mx.setPoint(y, x, on); }
+inline bool inRect(uint8_t x, uint8_t y, uint8_t x0, uint8_t y0, uint8_t w, uint8_t h) {
+  return (x >= x0 && x < (uint8_t)(x0 + w) && y >= y0 && y < (uint8_t)(y0 + h));
+}
+void clearRect(uint8_t x0, uint8_t y0, uint8_t w, uint8_t h) {
+  for (uint8_t x = x0; x < (uint8_t)(x0 + w); x++) for (uint8_t y = y0; y < (uint8_t)(y0 + h); y++) setPx(x, y, false);
+}
+void clearShowRegion() {
+  int16_t yA0 = SHOW_Y0, yA1 = SHOW_Y0 + SHOW_H - 1;
+  int16_t yB0 = (int16_t)SHOW_Y0 + SHOW_Y_SHIFT, yB1 = yB0 + SHOW_H - 1;
+  int16_t y0 = (yA0 < yB0) ? yA0 : yB0;
+  int16_t y1 = (yA1 > yB1) ? yA1 : yB1;
+  if (y0 < 0) y0 = 0; if (y1 >= H) y1 = H - 1; if (y1 < y0) return;
+  clearRect(SHOW_X0, (uint8_t)y0, SHOW_W, (uint8_t)(y1 - y0 + 1));
+}
+void clearAllVisible() { clearShowRegion(); clearRect(MAIN_WIN_X0, MAIN_WIN_Y0, MAIN_WIN_W, MAIN_WIN_H); }
+
+// Face mask (normal mode)
+void enforceFaceMaskOnly() {
+  for (uint8_t x = FACE_X0; x < (uint8_t)(FACE_X0 + FACE_W); x++) {
+    for (uint8_t y = 0; y < H; y++) {
+      bool ok =
+        inRect(x, y, EYE_L_X0, EYE_Y0,   EYE_W,   EYE_H) ||
+        inRect(x, y, EYE_R_X0, EYE_Y0,   EYE_W,   EYE_H) ||
+        inRect(x, y, MOUTH_X0, MOUTH_Y0, MOUTH_W, MOUTH_H);
+      if (!ok) setPx(x, y, false);
+    }
+  }
+}
+
+// Left random field
+uint8_t leftCols[LEFT_W];
+uint8_t makeRandomCol8() { uint8_t v=0; for(uint8_t y=0;y<8;y++) if(urand8()<BIT_DENSITY) v|=(1u<<y); return v; }
+void drawLeftCol(uint8_t x, uint8_t bits8) { for (uint8_t y=0;y<8;y++) setPx(x,y,((bits8>>y)&1u)!=0); }
+void stepLeftScreen() { for(uint8_t x=0;x<LEFT_W;x++) if(urand16(LEFT_CHANGE_DIV)==0){ leftCols[x]=makeRandomCol8(); drawLeftCol(x,leftCols[x]); } }
+
+// Brain window random field (10x3)
+uint8_t mainCols[MAIN_WIN_W];
+uint8_t makeRandomCol3() { uint8_t v=0; for(uint8_t y=0;y<MAIN_WIN_H;y++) if(urand8()<BIT_DENSITY) v|=(1u<<y); return v; }
+void drawMainCol(uint8_t i, uint8_t bits3) {
+  uint8_t x = (uint8_t)(MAIN_WIN_X0 + i);
+  for (uint8_t y=0;y<MAIN_WIN_H;y++) setPx(x,(uint8_t)(MAIN_WIN_Y0+y),((bits3>>y)&1u)!=0);
+}
+void stepMainWindow() { for(uint8_t i=0;i<MAIN_WIN_W;i++) if(urand16(MAIN_CHANGE_DIV)==0){ mainCols[i]=makeRandomCol3(); drawMainCol(i,mainCols[i]); } }
+void initMainWindow() { for(uint8_t i=0;i<MAIN_WIN_W;i++){ mainCols[i]=makeRandomCol3(); drawMainCol(i,mainCols[i]); } }
+
+// Eyes / mouth
+uint32_t eyeL_nextPattern = 0, eyeR_nextPattern = 0, mouth_nextStep = 0;
+int8_t mouthPos = 0, mouthDir = 1;
+uint16_t makeRandomBits9(){ uint16_t v=0; for(uint8_t i=0;i<9;i++) if(urand8()<140) v|=(1u<<i); return v; }
+void drawEyePattern(uint8_t x0, uint8_t y0, uint16_t bits9){
+  for(uint8_t ry=0;ry<3;ry++) for(uint8_t rx=0;rx<3;rx++){ uint8_t i=(uint8_t)(ry*3+rx); setPx((uint8_t)(x0+rx),(uint8_t)(y0+ry),((bits9>>i)&1u)!=0); }
+}
+void stepEyes(uint32_t now){
+  if ((int32_t)(now - eyeL_nextPattern) >= 0) { drawEyePattern(EYE_L_X0, EYE_Y0, makeRandomBits9()); eyeL_nextPattern = now + urandRange(EYE_PATTERN_MIN_MS, EYE_PATTERN_MAX_MS); }
+  if ((int32_t)(now - eyeR_nextPattern) >= 0) { drawEyePattern(EYE_R_X0, EYE_Y0, makeRandomBits9()); eyeR_nextPattern = now + urandRange(EYE_PATTERN_MIN_MS, EYE_PATTERN_MAX_MS); }
+}
+void drawMouth(){
+  clearRect(MOUTH_X0, MOUTH_Y0, MOUTH_W, MOUTH_H);
+  uint8_t x=(uint8_t)(MOUTH_X0+1);
+  uint8_t y=(uint8_t)(MOUTH_Y0 + (MOUTH_H - 1 - mouthPos));
+  setPx(x,y,true);
+  if (urand16(3)==0 && (x+1)<(uint8_t)(MOUTH_X0+MOUTH_W)) setPx((uint8_t)(x+1),y,true);
+}
+void stepMouth(uint32_t now){
+  if ((int32_t)(now - mouth_nextStep) < 0) return;
+  mouthPos += mouthDir;
+  if (mouthPos <= 0) { mouthPos = 0; mouthDir = 1; }
+  if (mouthPos >= (int8_t)(MOUTH_H - 1)) { mouthPos = (int8_t)(MOUTH_H - 1); mouthDir = -1; }
+  mouth_nextStep = now + urandRange(MOUTH_STEP_MIN_MS, MOUTH_STEP_MAX_MS);
+  drawMouth();
+}
+
+// 3x5 font
+static const Glyph3x5 FONT3x5[] = {
+  {' ', {0b00000,0b00000,0b00000}},
+  {'*', {0b00100,0b11111,0b00100}},
+  {'?', {0b00000,0b10101,0b11000}},
+  {'0', {0b11111,0b10001,0b11111}},
+  {'1', {0b00000,0b11111,0b00000}},
+  {'4', {0b11100,0b00100,0b11111}},
+  {'7', {0b10000,0b10111,0b11000}},
+  {'A', {0b01111,0b10100,0b01111}},
+  {'C', {0b01110,0b10001,0b01010}},
+  {'E', {0b11111,0b10101,0b10001}},
+  {'G', {0b01110,0b10001,0b01011}},
+  {'H', {0b11111,0b00100,0b11111}},
+  {'K', {0b11111,0b00100,0b11011}},
+  {'L', {0b11111,0b00001,0b00001}},
+  {'M', {0b11111,0b01000,0b11111}},
+  {'P', {0b11111,0b10100,0b01000}},
+  {'S', {0b01001,0b10101,0b10010}},
+  {'T', {0b10000,0b11111,0b10000}},
+  {'W', {0b11111,0b00010,0b11111}},
+  {'Y', {0b11000,0b00111,0b11000}},
+  {'O', {0b01110,0b10001,0b01110}},
+  {'X', {0b11011,0b00100,0b11011}},
+};
+const Glyph3x5* glyph3(char c){ for(uint16_t i=0;i<sizeof(FONT3x5)/sizeof(FONT3x5[0]);i++) if(FONT3x5[i].c==c) return &FONT3x5[i]; return &FONT3x5[0]; }
+void drawChar3x5(uint8_t x, uint8_t y, char c){
+  const Glyph3x5* g = glyph3(c);
+  for(uint8_t cx=0;cx<3;cx++){
+    uint8_t bits=g->col[cx];
+    for(uint8_t cy=0;cy<5;cy++){
+      bool on=((bits>>cy)&1u)!=0;
+      int16_t py=(int16_t)y + (int16_t)cy + SHOW_Y_SHIFT;
+      if ((uint8_t)(x+cx) < W && py >= 0 && py < H) setPx((uint8_t)(x+cx),(uint8_t)py,on);
+    }
+  }
+}
+void drawText3x5_showWindowCentered(const char* s){
+  clearShowRegion();
+  uint8_t len=(uint8_t)strlen(s); if(!len) return;
+  uint8_t textW=(uint8_t)(len*4-1);
+  int16_t x=SHOW_X0 + (int16_t)(SHOW_W - textW)/2;
+  for(uint8_t i=0;i<len;i++){ if(x>=0 && x<=255) drawChar3x5((uint8_t)x, SHOW_Y0, s[i]); x += 4; }
+}
+void drawText3x5_showWindowAt(int16_t x, const char* s){
+  for(uint8_t i=0; s[i]; i++){
+    int16_t cx = x + (int16_t)i * 4;
+    if (cx > (SHOW_X0 + SHOW_W - 1)) break;
+    if (cx < (SHOW_X0 - 3)) continue;
+    drawChar3x5((uint8_t)cx, SHOW_Y0, s[i]);
+  }
+}
+
+// XO lane
+void drawX5x5(uint8_t x0, uint8_t y0){ for(uint8_t i=0;i<5;i++){ setPx((uint8_t)(x0+i),(uint8_t)(y0+i),true); setPx((uint8_t)(x0+(4-i)),(uint8_t)(y0+i),true);} }
+void drawO5x5(uint8_t x0, uint8_t y0){
+  for(uint8_t x=1;x<=3;x++){ setPx((uint8_t)(x0+x),(uint8_t)(y0+0),true); setPx((uint8_t)(x0+x),(uint8_t)(y0+4),true); }
+  for(uint8_t y=1;y<=3;y++){ setPx((uint8_t)(x0+0),(uint8_t)(y0+y),true); setPx((uint8_t)(x0+4),(uint8_t)(y0+y),true); }
+}
+void drawBlank5x5(uint8_t x0, uint8_t y0){ for(uint8_t x=0;x<5;x++) for(uint8_t y=0;y<5;y++) setPx((uint8_t)(x0+x),(uint8_t)(y0+y),false); }
+void drawSymbol5x5(uint8_t slot, char c){
+  static const uint8_t slotX[3] = { (uint8_t)(SHOW_X0 + 3), (uint8_t)(SHOW_X0 + 10), (uint8_t)(SHOW_X0 + 17) };
+  uint8_t x0 = slotX[slot];
+  int16_t y0 = (int16_t)SHOW_Y0 + SHOW_Y_SHIFT;
+  if (y0 < 0) y0 = 0; if (y0 > (int16_t)(H-5)) y0 = (int16_t)(H-5);
+  drawBlank5x5(x0, (uint8_t)y0);
+  if (c=='X') drawX5x5(x0,(uint8_t)y0); else if (c=='O') drawO5x5(x0,(uint8_t)y0);
+}
+void drawLane(const char lane[3]){ clearShowRegion(); for(uint8_t i=0;i<3;i++) drawSymbol5x5(i, lane[i]); }
+
+// Intermission state
+enum SeqState : uint8_t {
+  ST_CRACK1_INIT = 0, ST_CRACK1_RUN, ST_CRACK1_HOLD, ST_CRACK2_INIT, ST_CRACK2_RUN,
+  ST_CRACK_SOLVED_HOLD, ST_CRACK2_HOLD, ST_CRACK_CONFIRM, ST_POST_CRACK_PAUSE,
+  ST_XO_ROUND_INIT, ST_XO_ROUND_SPIN, ST_XO_FINAL_LOCK1, ST_XO_FINAL_LOCK2, ST_XO_FINAL_LOCK3,
+  ST_XO_FINAL_HOLD, ST_XO_FINAL_FLASH, ST_SHUTDOWN, ST_MSG_INIT, ST_MSG_SCROLL, ST_MSG_HOLD
+};
+
+SeqState seqState = ST_CRACK1_INIT;
+uint32_t stateAt = 0, stepAt = 0, nextStepAt = 0;
+const char CODE1[] = "CPE17";
+const char CODE2[] = "04TKS";
+char crackBuf[6] = "*****";
+uint8_t crackPos = 0;
+char crackTry = 'A';
+uint8_t confirmBlinkCount = 0;
+bool confirmShowFirst = true;
+
+uint8_t xoRound = 0;
+char xoLane[3] = { 'X','O','X' };
+uint32_t xoRoundEndAt = 0, xoNextSpinAt = 0, xoFlashNextAt = 0;
+uint8_t xoFlashCount = 0;
+bool xoFlashVisible = true;
+static const char XXX_LANE[3] = { 'X','X','X' };
+
+const char MSG[] = "SHALL WE PLAY A GAME?";
+int16_t msgScrollX = 0;
+uint32_t msgNextAt = 0, msgHoldUntil = 0;
+
+bool intermissionActive = false;
+uint32_t nextIntermissionAt = 0;
+
+char nextCrackChar(char c){ if(c>='A'&&c<'Z') return c+1; if(c=='Z') return '0'; if(c>='0'&&c<'9') return c+1; if(c=='9') return 'A'; return 'A'; }
+void crackPhaseInit(){
+  crackBuf[0]='*'; crackBuf[1]='*'; crackBuf[2]='*'; crackBuf[3]='*'; crackBuf[4]='*'; crackBuf[5]=0;
+  crackPos=0; crackTry='A'; drawText3x5_showWindowCentered(crackBuf);
+}
+bool crackPhaseTick(const char* target){
+  uint32_t now = millis();
+  if ((int32_t)(now - stepAt) < 0) return false;
+  stepAt = now + urandRange(CRACK_CHAR_STEP_MS_MIN, CRACK_CHAR_STEP_MS_MAX);
+  crackBuf[crackPos] = crackTry;
+  drawText3x5_showWindowCentered(crackBuf);
+  if (crackTry == target[crackPos]) {
+    crackBuf[crackPos] = target[crackPos];
+    crackPos++;
+    drawText3x5_showWindowCentered(crackBuf);
+    if (crackPos >= 5) return true;
+    crackTry = 'A';
+    stepAt = now + CRACK_LOCK_HOLD_MS;
+  } else crackTry = nextCrackChar(crackTry);
+  return false;
+}
+void xoRandomizeLane(){ for(uint8_t i=0;i<3;i++) xoLane[i] = (urand16(2)==0)?'X':'O'; }
+void xoRoundInit(){ xoRandomizeLane(); drawLane(xoLane); uint32_t now=millis(); xoRoundEndAt=now+XO_ROUND_SPIN_MS[xoRound]; xoNextSpinAt=now+XO_SPIN_STEP_MS[xoRound]; }
+
+void intermissionInit(){
+  seqState = ST_CRACK1_INIT;
+  stateAt = millis(); stepAt = millis();
+  clearAllVisible();
+  mx.control(MD_MAX72XX::INTENSITY, INTENSITY);
+  initMainWindow(); // keep the 10x3 brain alive
+}
+
+bool intermissionUpdate(){
+  uint32_t now = millis();
+  if (seqState != ST_SHUTDOWN) stepMainWindow();
+
+  switch (seqState) {
+    case ST_CRACK1_INIT: crackPhaseInit(); stepAt = now + 250; seqState = ST_CRACK1_RUN; break;
+    case ST_CRACK1_RUN: if (crackPhaseTick(CODE1)) { stateAt = now + CRACK_PHASE_PAUSE_MS; seqState = ST_CRACK1_HOLD; } break;
+    case ST_CRACK1_HOLD: if ((int32_t)(now - stateAt) >= 0) seqState = ST_CRACK2_INIT; break;
+    case ST_CRACK2_INIT: crackPhaseInit(); stepAt = now + 180; seqState = ST_CRACK2_RUN; break;
+
+    case ST_CRACK2_RUN:
+      if (crackPhaseTick(CODE2)) { drawText3x5_showWindowCentered(CODE2); stateAt = now + CRACK_SOLVED_HOLD_MS; seqState = ST_CRACK_SOLVED_HOLD; }
+      break;
+
+    case ST_CRACK_SOLVED_HOLD:
+      if ((int32_t)(now - stateAt) >= 0) {
+        confirmBlinkCount = 0; confirmShowFirst = false; stepAt = now + CRACK_CONFIRM_BLINK_MS;
+        drawText3x5_showWindowCentered(CODE2); seqState = ST_CRACK_CONFIRM;
+      } break;
+
+    case ST_CRACK_CONFIRM:
+      if ((int32_t)(now - stepAt) >= 0) {
+        stepAt = now + CRACK_CONFIRM_BLINK_MS;
+        confirmShowFirst = !confirmShowFirst;
+        drawText3x5_showWindowCentered(confirmShowFirst ? CODE1 : CODE2);
+        confirmBlinkCount++;
+        if (confirmBlinkCount >= CRACK_CONFIRM_BLINKS) { xoRound = 0; stateAt = now + POST_CRACK_TO_XO_DELAY_MS; seqState = ST_POST_CRACK_PAUSE; }
+      } break;
+
+    case ST_POST_CRACK_PAUSE: if ((int32_t)(now - stateAt) >= 0) seqState = ST_XO_ROUND_INIT; break;
+    case ST_XO_ROUND_INIT: xoRoundInit(); seqState = ST_XO_ROUND_SPIN; break;
+
+    case ST_XO_ROUND_SPIN:
+      if ((int32_t)(now - xoNextSpinAt) >= 0) { xoNextSpinAt = now + XO_SPIN_STEP_MS[xoRound]; xoRandomizeLane(); drawLane(xoLane); }
+      if ((int32_t)(now - xoRoundEndAt) >= 0) {
+        if (xoRound < XO_ROUNDS - 1) { xoRandomizeLane(); drawLane(xoLane); xoRound++; stateAt = now + 220; seqState = ST_XO_ROUND_INIT; }
+        else { xoRandomizeLane(); drawLane(xoLane); stateAt = now + XO_LOCK_GAP_MS; seqState = ST_XO_FINAL_LOCK1; }
+      } break;
+
+    case ST_XO_FINAL_LOCK1: if ((int32_t)(now - stateAt) >= 0) { xoLane[0]='X'; drawLane(xoLane); stateAt = now + XO_LOCK_GAP_MS; seqState = ST_XO_FINAL_LOCK2; } break;
+    case ST_XO_FINAL_LOCK2: if ((int32_t)(now - stateAt) >= 0) { xoLane[1]='X'; drawLane(xoLane); stateAt = now + XO_LOCK_GAP_MS; seqState = ST_XO_FINAL_LOCK3; } break;
+    case ST_XO_FINAL_LOCK3: if ((int32_t)(now - stateAt) >= 0) { xoLane[2]='X'; drawLane(xoLane); stateAt = now + XO_FINAL_HOLD_MS; seqState = ST_XO_FINAL_HOLD; } break;
+
+    case ST_XO_FINAL_HOLD:
+      if ((int32_t)(now - stateAt) >= 0) { xoFlashCount=0; xoFlashVisible=false; xoFlashNextAt=now+XO_FLASH_MS; clearShowRegion(); seqState = ST_XO_FINAL_FLASH; }
+      break;
+
+    case ST_XO_FINAL_FLASH:
+      if ((int32_t)(now - xoFlashNextAt) >= 0) {
+        xoFlashNextAt = now + XO_FLASH_MS;
+        xoFlashVisible = !xoFlashVisible;
+        if (xoFlashVisible) drawLane(XXX_LANE); else clearShowRegion();
+        xoFlashCount++;
+        if (xoFlashCount >= (uint8_t)(XO_FLASH_COUNT * 2)) { clearAllVisible(); mx.control(MD_MAX72XX::INTENSITY, 0); stateAt = now + SHUTDOWN_MS; seqState = ST_SHUTDOWN; }
+      } break;
+
+    case ST_SHUTDOWN: if ((int32_t)(now - stateAt) >= 0) { mx.control(MD_MAX72XX::INTENSITY, INTENSITY); seqState = ST_MSG_INIT; } break;
+
+    case ST_MSG_INIT:
+      clearShowRegion(); msgScrollX = SHOW_X0 + SHOW_W; msgNextAt = now + 120; seqState = ST_MSG_SCROLL; break;
+
+    case ST_MSG_SCROLL:
+      if ((int32_t)(now - msgNextAt) >= 0) {
+        msgNextAt = now + MESSAGE_SCROLL_MS;
+        clearShowRegion();
+        drawText3x5_showWindowAt(msgScrollX, MSG);
+        msgScrollX--;
+        int16_t totalW = (int16_t)strlen(MSG) * 4 - 1;
+        if (msgScrollX + totalW < SHOW_X0) { clearShowRegion(); msgHoldUntil = now + MESSAGE_HOLD_MS; seqState = ST_MSG_HOLD; }
+      } break;
+
+    case ST_MSG_HOLD:
+      if ((int32_t)(now - msgHoldUntil) >= 0) return true;
+      break;
+
+    default: break;
+  }
+  return false;
+}
+
+void initAll() {
+  mx.clear();
+  for (uint8_t x = 0; x < LEFT_W; x++) { leftCols[x] = makeRandomCol8(); drawLeftCol(x, leftCols[x]); }
+  initMainWindow();
+
+  uint32_t now = millis();
+  eyeL_nextPattern = now + urandRange(0, EYE_PATTERN_MAX_MS);
+  eyeR_nextPattern = now + urandRange(0, EYE_PATTERN_MAX_MS);
+  mouth_nextStep   = now + urandRange(MOUTH_STEP_MIN_MS, MOUTH_STEP_MAX_MS);
+
+  drawEyePattern(EYE_L_X0, EYE_Y0, makeRandomBits9());
+  drawEyePattern(EYE_R_X0, EYE_Y0, makeRandomBits9());
+  drawMouth();
+  enforceFaceMaskOnly();
+}
+
+void maxInitPass(uint8_t intensity) {
+  mx.control(MD_MAX72XX::SHUTDOWN, true);
+  delay(15);
+  mx.control(MD_MAX72XX::SHUTDOWN, false);
+  mx.control(MD_MAX72XX::TEST, false);
+  mx.control(MD_MAX72XX::INTENSITY, intensity);
+  mx.clear();
+}
+
+void setup() {
+  pinMode(CS_PIN, OUTPUT);   digitalWrite(CS_PIN, HIGH);
+  pinMode(PIN_SCK, OUTPUT);  digitalWrite(PIN_SCK, LOW);
+  pinMode(PIN_MOSI, OUTPUT); digitalWrite(PIN_MOSI, LOW);
+  delay(STARTUP_SETTLE_MS);
+
+  SPI.begin(PIN_SCK, -1, PIN_MOSI, CS_PIN);
+  SPI.setFrequency(SPI_HZ);
+  SPI.setDataMode(SPI_MODE0);
+
+  mx.begin();
+
+  for (uint8_t i = 0; i < INIT_PASSES; i++) { maxInitPass(0); delay(INIT_GAP_MS); }
+  for (uint8_t b = 0; b <= INTENSITY; b++) { mx.control(MD_MAX72XX::INTENSITY, b); delay(35); }
+
+  rng32(); rng32(); rng32();
+
+  initAll();
+  nextStepAt = millis();
+  intermissionActive = false;
+  nextIntermissionAt = millis() + INTERMISSION_INTERVAL_MS;
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  if (!intermissionActive && (int32_t)(now - nextIntermissionAt) >= 0) {
+    intermissionActive = true;
+    intermissionInit();
+  }
+
+  if (intermissionActive) {
+    if (intermissionUpdate()) {
+      intermissionActive = false;
+      initAll();
+      nextStepAt = millis();
+      nextIntermissionAt = millis() + INTERMISSION_INTERVAL_MS;
+    }
+    return;
+  }
+
+  stepEyes(now);
+  stepMouth(now);
+
+  if ((int32_t)(now - nextStepAt) >= 0) {
+    if (urand16(HOLD_CHANCE_DIV) == 0) nextStepAt = now + urandRange(HOLD_MIN_MS, HOLD_MAX_MS);
+    else { stepLeftScreen(); stepMainWindow(); nextStepAt = now + STEP_DELAYS[urand16(4)]; }
+  }
+
+  enforceFaceMaskOnly();
+}
